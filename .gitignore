@@ -1,1 +1,2 @@
-Raw_data/*.csv
+Raw_data/
+*.csv
