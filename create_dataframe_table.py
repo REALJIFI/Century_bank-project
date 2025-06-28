@@ -1,47 +1,82 @@
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import monotonically_increasing_id
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number, when, col
 
-def create_dataframe_tables(df: DataFrame) -> dict:
-    """
-    Creates several DataFrame tables (Transaction, Customer, Employee, Fact)
-    based on the cleaned Century Bank data.
+# Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("CenturyBankETL") \
+    .getOrCreate()
 
-    Args:
-        df (DataFrame): The cleaned Spark DataFrame (Century_bank_clean).
+# Replace these with your actual values
+url = "jdbc:postgresql://your_host:your_port/your_db"
+properties = {
+    "user": "DB_USER",
+    "password": "DB_PASSWORD",
+    "driver": "org.postgresql.Driver"
+}
 
-    Returns:
-        dict: A dictionary containing the created DataFrames
-              with keys 'Transaction', 'Customer', 'Employee', and 'Fact_table'.
-    """
+# Load cleaned data
+Century_bank_clean = spark.read.parquet("path_to_cleaned_data")
 
-    # Transaction table
-    Transaction = df.select('Transaction_Date', 'Amount', 'Transaction_Type')
-    Transaction = Transaction.withColumn('Transaction_ID', monotonically_increasing_id())
-    Transaction = Transaction.select('Transaction_ID', 'Transaction_Date', 'Amount', 'Transaction_Type')
+# --- Employee Dimension ---
+employee_window = Window.orderBy("Company", "Job_Title", "Gender", "Marital_Status")
+Employee = Century_bank_clean.select(
+    'Company', 'Job_Title', 'Gender', 'Marital_Status'
+).distinct()
+Employee = Employee.withColumn("Employee_ID", row_number().over(employee_window).cast("long"))
+Employee = Employee.select("Employee_ID", "Company", "Job_Title", "Gender", "Marital_Status")
+Employee.write.jdbc(url=url, table="loan_project.Employee_Table", mode="append", properties=properties)
 
-    # Customer table
-    Customer = df.select('Customer_Name', 'Customer_Address', 'Customer_City',
-                         'Customer_State', 'Customer_Country', 'Email', 'Phone_Number').distinct()
-    Customer = Customer.withColumn('Customer_ID', monotonically_increasing_id())
-    Customer = Customer.select('Customer_ID', 'Customer_Name', 'Customer_Address', 'Customer_City',
-                         'Customer_State', 'Customer_Country', 'Email', 'Phone_Number')
+# --- Customer Dimension ---
+customer_window = Window.orderBy("Customer_Name", "Email", "Phone_Number")
+Customer = Century_bank_clean.select(
+    'Customer_Name', 'Customer_Address', 'Customer_City',
+    'Customer_State', 'Customer_Country', 'Email', 'Phone_Number'
+).distinct()
+Customer = Customer.withColumn("Customer_ID", row_number().over(customer_window).cast("long"))
+Customer = Customer.select(
+    "Customer_ID", "Customer_Name", "Customer_Address", "Customer_City",
+    "Customer_State", "Customer_Country", "Email", "Phone_Number"
+)
+Customer.write.jdbc(url=url, table="loan_project.Customer_Table", mode="append", properties=properties)
 
-    # Employee table
-    Employee = df.select('Company', 'Job_Title', 'Gender', 'Marital_Status').distinct()
-    Employee = Employee.withColumn('Employee_ID', monotonically_increasing_id())
-    Employee = Employee.select('Employee_ID', 'Company', 'Job_Title', 'Gender', 'Marital_Status')
+# --- Transaction Dimension ---
+transaction_window = Window.orderBy("Transaction_Date", "Amount")
+Transaction = Century_bank_clean.select('Transaction_Date', 'Amount', 'Transaction_Type')
+Transaction = Transaction.withColumn("Transaction_ID", row_number().over(transaction_window).cast("long"))
+Transaction = Transaction.select('Transaction_ID', 'Transaction_Date', 'Amount', 'Transaction_Type')
+Transaction.write.jdbc(url=url, table="loan_project.Transaction_Table", mode="append", properties=properties)
 
-    # Fact table
-    Fact_table = df.join(Customer, ['Customer_Name', 'Customer_Address', 'Customer_City',
-                                     'Customer_State', 'Customer_Country', 'Email', 'Phone_Number'], 'left') \
-                   .join(Transaction, ['Transaction_Date', 'Amount', 'Transaction_Type'], 'left') \
-                   .join(Employee, ['Company', 'Job_Title', 'Gender', 'Marital_Status'], 'left') \
-                   .select('Transaction_ID', 'Customer_ID', 'Employee_ID', 'Credit_Card_Number', 'IBAN',
-                           'Currency_Code', 'Random_Number', 'Category', 'Group', 'Is_Active', 'Last_Updated', 'Description')
+# --- Load Dimension Tables from PostgreSQL ---
+Employee_df = spark.read.jdbc(url=url, table="loan_project.Employee_Table", properties=properties)
+Customer_df = spark.read.jdbc(url=url, table="loan_project.Customer_Table", properties=properties)
+Transaction_df = spark.read.jdbc(url=url, table="loan_project.Transaction_Table", properties=properties)
 
-    return {
-        'Transaction': Transaction,
-        'Customer': Customer,
-        'Employee': Employee,
-        'Fact_table': Fact_table
-    }
+# --- Fact Table ---
+Fact_table = Century_bank_clean \
+    .join(Employee_df, ['Company', 'Job_Title', 'Gender', 'Marital_Status'], 'left') \
+    .join(Customer_df, [
+        'Customer_Name', 'Customer_Address', 'Customer_City',
+        'Customer_State', 'Customer_Country', 'Email', 'Phone_Number'
+    ], 'left') \
+    .join(Transaction_df, ['Transaction_Date', 'Amount', 'Transaction_Type'], 'left') \
+    .select(
+        'Transaction_ID', 'Customer_ID', 'Employee_ID',
+        'Credit_Card_Number', 'IBAN', 'Currency_Code', 'Random_Number',
+        'Category', 'Group',
+        when(col("Is_Active") == "Yes", True)
+            .when(col("Is_Active") == "No", False)
+            .otherwise(None).alias("Is_Active"),
+        'Last_Updated', 'Description'
+    )
+
+fact_window = Window.orderBy('Employee_ID', 'Transaction_ID', 'Customer_ID')
+Fact_table = Fact_table.withColumn("Fact_ID", row_number().over(fact_window).cast("long"))
+Fact_table = Fact_table.select(
+    'Fact_ID', 'Transaction_ID', 'Customer_ID', 'Employee_ID',
+    'Credit_Card_Number', 'IBAN', 'Currency_Code', 'Random_Number',
+    'Category', 'Group', 'Is_Active', 'Last_Updated', 'Description'
+)
+Fact_table.write.jdbc(url=url, table="loan_project.Fact_table", mode="append", properties=properties)
+
+print("✅ All tables written successfully and foreign keys are consistent.")
