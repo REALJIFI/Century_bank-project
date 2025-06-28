@@ -1,5 +1,6 @@
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import col
+from pyspark.sql.functions import to_date, round
 
 def transform_dataframe(df: DataFrame) -> DataFrame:
     """
@@ -45,6 +46,12 @@ def transform_dataframe(df: DataFrame) -> DataFrame:
 
     # Drop rows where Last_Updated is null
     cleaned_df = cleaned_df.na.drop(subset=['Last_Updated'])
+    
+    # Standardize the date and amount columns
+    Century_bank_clean = Century_bank_clean \
+    .withColumn("Transaction_Date", to_date("Transaction_Date")) \
+    .withColumn("Amount", round(col("Amount"), 2)) \
+    .withColumn("Transaction_Type", col("Transaction_Type").cast("string"))
 
     print("\nData Quality Note:")
     print("--- Last_Updated is likely a timestamp or date column showing when a record was last modified or updated.")
